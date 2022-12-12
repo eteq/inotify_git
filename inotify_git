@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+
+
+import datetime
+from fnmatch import fnmatch
+from pathlib import Path
+from typing import Optional
+
+import git
+
+import pyinotify
+
+import typer
+
+class EventHandler(pyinotify.ProcessEvent):
+    def process_default(self, event):
+        self._processor.process_event(event.pathname)
+
+
+class Processor:
+    def __init__(self, path, patterns, max_commit_cadence, remote_name, verbose):
+        self.verbose = verbose
+
+        self.path = path
+        self.patterns = tuple(patterns)
+        self.max_commit_cadence = max_commit_cadence
+
+        self.repo = git.Repo(self.path)
+
+        self.remote = None
+        for rem in self.repo.remotes:
+            if rem.name == remote_name:
+                self.remote = rem
+                break
+        if self.remote is None:
+            raise ValueError(f'remote {remote_name} not found')
+
+    def process_event(self, pathname):
+        if any([fnmatch(pathname, pattern) for pattern in self.patterns]):
+            if self.check_if_time_passed():
+                self.add_and_commit()
+                if self.verbose:
+                    print("Pushing!")
+                self.remote.push().raise_if_error()
+            elif self.verbose:
+                print('not committing due to commit cadence')
+
+    def check_if_time_passed(self):
+        utcnow = datetime.datetime.now().astimezone(datetime.timezone.utc) 
+        dt = utcnow - self.repo.head.commit.committed_datetime
+        return dt.total_seconds() >= self.max_commit_cadence
+
+    def add_and_commit(self):
+        for diff in self.repo.index.diff(None):
+            if (any([fnmatch(diff.a_path, pattern) for pattern in self.patterns]) or 
+                any([fnmatch(diff.b_path, pattern) for pattern in self.patterns])):
+                if diff.deleted_file:
+                    self.repo.index.remove(diff.b_path)
+                    if self.verbose:
+                        print("removing file", diff.b_path)
+                else:
+                    self.repo.index.add(diff.b_path)
+                    if self.verbose:
+                        print("updating file", diff.b_path)
+
+        for untracked in self.repo.untracked_files:
+            if any([fnmatch(untracked, pattern) for pattern in self.patterns]):
+                if self.verbose:
+                    print("adding file", untracked)
+                self.repo.index.add(untracked)
+
+        if self.repo.index.diff(self.repo.head.commit):
+            self.repo.index.commit('auto-commit from inotify_git')
+
+app = typer.Typer()
+
+@app.command()
+def main(path: Path = typer.Argument(..., file_okay=False, dir_okay=True), 
+         patterns: str = '*.md,*.txt', 
+         max_commit_cadence: float = 300, 
+         remote_name: str = 'origin', 
+         verbose: bool = False):
+    
+    processor = Processor(path, patterns.split(','), max_commit_cadence, remote_name, verbose)
+
+    mask = pyinotify.IN_DELETE | pyinotify.IN_CREATE | pyinotify.IN_MODIFY | pyinotify.IN_MOVED_TO | pyinotify.IN_MOVED_FROM
+
+    wm = pyinotify.WatchManager()
+    handler = EventHandler()
+    handler._processor = processor
+    notifier = pyinotify.Notifier(wm, default_proc_fun=handler)
+    wm.add_watch(str(path), mask)
+
+    notifier.loop()
+
+if __name__ == "__main__":
+    app()
